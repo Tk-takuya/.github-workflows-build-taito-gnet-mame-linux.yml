@@ -1,0 +1,176 @@
+name: Build Taito G-NET MAME for sound analysis (Linux)
+
+'on':
+  workflow_dispatch:
+    inputs:
+      mame_ref:
+        description: 'MAME official tag; leave mame0289 for reproducibility'
+        required: true
+        default: mame0289
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      MAME_REF: ${{ inputs.mame_ref }}
+      SUBTARGET: gnetmame
+      MAME_SOURCES: src/mame/sony/zn.cpp,src/mame/sony/taitogn.cpp
+      REQUIRED_GAMES: >-
+        raycris raycrisj coh3002t raystorm gdarius
+
+    steps:
+      - name: Check out workflow for reproducibility
+        uses: actions/checkout@v4
+
+      - name: Install MAME build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            git build-essential python3 zip \
+            libsdl2-dev libsdl2-ttf-dev libfontconfig-dev \
+            libpulse-dev libasound2-dev \
+            qt6-base-dev qt6-base-dev-tools qtchooser
+
+      - name: Fetch official MAME source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$MAME_REF" https://github.com/mamedev/mame.git mame
+          test -f mame/src/mame/sony/taitogn.cpp
+          test -f mame/src/mame/sony/zn.cpp
+          git -C mame rev-parse HEAD
+          git -C mame describe --always --tags
+
+      - name: Build Sony ZN and Taito G-NET drivers
+        shell: bash
+        working-directory: mame
+        run: |
+          set -euo pipefail
+          make -j2 \
+            SUBTARGET="$SUBTARGET" \
+            SOURCES="$MAME_SOURCES" \
+            REGENIE=1 \
+            USE_QTDEBUG=0 \
+            SYMBOLS=0 \
+            2>&1 | tee "$RUNNER_TEMP/taito-mame-build.log"
+          test -x "./$SUBTARGET"
+          "./$SUBTARGET" -version
+
+      - name: Verify target games and export board information
+        shell: bash
+        working-directory: mame
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/taito-machine-xml"
+          for game in $REQUIRED_GAMES; do
+            echo "Checking MAME system: $game"
+            "./$SUBTARGET" -listfull "$game" | grep -E "^${game}[[:space:]]+" >/dev/null || {
+              echo "Missing expected system in build: $game" >&2
+              exit 1
+            }
+            "./$SUBTARGET" -listxml "$game" > "$RUNNER_TEMP/taito-machine-xml/$game.xml"
+          done
+          "./$SUBTARGET" -listsource > "$RUNNER_TEMP/taito-list-source.txt"
+          "./$SUBTARGET" -listfull > "$RUNNER_TEMP/taito-list-full.txt"
+
+      - name: Package reusable Linux binary and sound-analysis sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/taito-gnet-mame-linux-x86_64"
+          mkdir -p "$OUT/lib" "$OUT/roms" "$OUT/diagnostics/xml" \
+                   "$OUT/source/src/mame/sony" "$OUT/source/src/devices"
+          cp "mame/$SUBTARGET" "$OUT/gnetmame"
+          cp "$RUNNER_TEMP/taito-mame-build.log" "$OUT/diagnostics/build.log"
+          cp "$RUNNER_TEMP/taito-list-source.txt" "$OUT/diagnostics/list-source.txt"
+          cp "$RUNNER_TEMP/taito-list-full.txt" "$OUT/diagnostics/list-full.txt"
+          cp -a "$RUNNER_TEMP/taito-machine-xml/." "$OUT/diagnostics/xml/"
+          cp -a mame/src/mame/sony/taitogn.cpp mame/src/mame/sony/zn.h "$OUT/source/src/mame/sony/"
+          mkdir -p "$OUT/source/src/mame/shared" "$OUT/source/src/devices/cpu"
+          while IFS= read -r f; do
+            dest="$OUT/source/${f#mame/}"
+            mkdir -p "$(dirname "$dest")"
+            cp "$f" "$dest"
+          done < <(find mame/src/mame -name "taito_zm.*")
+          cp -a mame/src/devices/cpu/mn10200 mame/src/devices/cpu/tms57002 "$OUT/source/src/devices/cpu/"
+          cp -a mame/src/mame/sony/zn.cpp "$OUT/source/src/mame/sony/"
+          cp -a mame/src/devices/sound "$OUT/source/src/devices/"
+          cp .github/workflows/build-taito-gnet-mame-linux.yml "$OUT/diagnostics/build-workflow.yml"
+          ldd "$OUT/gnetmame" | tee "$OUT/diagnostics/ldd.txt"
+
+          # Include directly linked shared libraries, excluding incompatible
+          # host-specific glibc and its loader. A matching Linux host is needed.
+          while IFS= read -r so; do
+            [ -f "$so" ] || continue
+            base="$(basename "$so")"
+            case "$base" in
+              libc.so.*|libm.so.*|libpthread.so.*|librt.so.*|libdl.so.*|libresolv.so.*|libnss_*|ld-linux*|libanl.so.*|libutil.so.*)
+                continue ;;
+            esac
+            cp -L "$so" "$OUT/lib/$base"
+          done < <(ldd "$OUT/gnetmame" | awk '$2 == "=>" && $3 ~ /^\// {print $3}' | sort -u)
+
+          cat > "$OUT/run-mame.sh" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          HERE="$(cd "$(dirname "$0")" && pwd)"
+          export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          cd "$HERE"
+          exec "$HERE/gnetmame" "$@"
+          SH
+          chmod +x "$OUT/run-mame.sh"
+
+          cat > "$OUT/README.txt" <<TXT
+          Taito G-NET MAME for sound analysis, Linux x86_64
+          MAME reference: $MAME_REF
+          Source commit: $(git -C mame rev-parse HEAD)
+          Driver coverage: Sony ZN and Taito G-NET
+          Build: SUBTARGET=$SUBTARGET SOURCES=$MAME_SOURCES REGENIE=1
+          Required systems checked: $REQUIRED_GAMES
+
+          No ROMs are distributed in this artifact.
+          Use ROMs compatible with this MAME version; parent/BIOS sets may be required.
+          Intended for compatible Linux x86_64 hosts (Ubuntu 24.04 / compatible).
+          Source-driver coverage is NOT a guarantee of successful sound transcription.
+          MAME's sound emulation may be imperfect for individual boards.
+
+          ./run-mame.sh -version
+          ./run-mame.sh -listfull raycrisj
+          ./run-mame.sh raycrisj -debug -window
+          ./run-mame.sh raycrisj -autoboot_script /path/to/capture.lua
+
+          Look in diagnostics/xml for sound chip devices and CPU descriptions.
+          Save this entire ZIP plus its checksum as the canonical runtime.
+          TXT
+
+          (
+            cd "$OUT"
+            ./run-mame.sh -version > diagnostics/version.txt
+            find . -type f ! -path './diagnostics/SHA256SUMS.txt' -print0 \
+              | sort -z | xargs -0 sha256sum > diagnostics/SHA256SUMS.txt
+          )
+          (
+            cd "$GITHUB_WORKSPACE"
+            zip -q -r -9 taito-gnet-mame-linux-x86_64.zip taito-gnet-mame-linux-x86_64
+          )
+          test -s "$GITHUB_WORKSPACE/taito-gnet-mame-linux-x86_64.zip"
+          sha256sum "$GITHUB_WORKSPACE/taito-gnet-mame-linux-x86_64.zip" \
+            | tee "$GITHUB_WORKSPACE/taito-gnet-mame-linux-x86_64.zip.sha256"
+          ls -lh "$GITHUB_WORKSPACE/taito-gnet-mame-linux-x86_64.zip"
+
+      - name: Publish the reusable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: taito-gnet-mame-linux-x86_64
+          path: |
+            taito-gnet-mame-linux-x86_64.zip
+            taito-gnet-mame-linux-x86_64.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
